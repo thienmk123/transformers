@@ -16,12 +16,13 @@
 import copy
 import math
 import random
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union, Dict
 
 import torch
 import torch.utils.checkpoint
-from torch import nn
-from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+from torch import nn, Tensor
+from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss, Parameter
+import torch.nn.functional as F
 
 from ...activations import ACT2FN
 from ...modeling_outputs import (
@@ -147,36 +148,43 @@ class MBartLearnedPositionalEmbedding(nn.Embedding):
 class MBartLongSelfAttention(nn.Module):
 
     def __init__(
-        self, 
-        embed_dim: int,
-        num_heads: int,
-        dropout: float = 0.0,
-        bias: bool = True,
+        self,
+        embed_dim,
+        num_heads,
+        dropout=0.0,
+        bias=True,
+        add_bias_kv=False,
         attention_window=512,
     ):
         super().__init__()
-
         self.embed_dim = embed_dim
+        self.qkv_same_dim = self.kdim == embed_dim and self.vdim == embed_dim
+
         self.num_heads = num_heads
         self.dropout = dropout
         self.head_dim = embed_dim // num_heads
+        assert (
+            self.head_dim * num_heads == self.embed_dim
+        ), "embed_dim must be divisible by num_heads"
+        self.scaling = self.head_dim ** -0.5
 
-        if (self.head_dim * num_heads) != self.embed_dim:
-            raise ValueError(
-                f"embed_dim must be divisible by num_heads (got `embed_dim`: {self.embed_dim}"
-                f" and `num_heads`: {num_heads})."
-            )
-           
-        self.scaling = self.head_dim**-0.5
+        self.k_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
 
-        self.query = nn.Linear(self.embed_dim, self.embed_dim)
-        self.key = nn.Linear(self.embed_dim, self.embed_dim)
-        self.value = nn.Linear(self.embed_dim, self.embed_dim)
+        # Separate projections for the global attention
+        self.k_proj_global = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.v_proj_global = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.q_proj_global = nn.Linear(embed_dim, embed_dim, bias=bias)
 
-        # separate projection layers for tokens with global attention
-        self.query_global = nn.Linear(self.embed_dim, self.embed_dim)
-        self.key_global = nn.Linear(self.embed_dim, self.embed_dim)
-        self.value_global = nn.Linear(self.embed_dim, self.embed_dim)
+
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+
+        if add_bias_kv:
+            self.bias_k = Parameter(torch.Tensor(1, 1, embed_dim))
+            self.bias_v = Parameter(torch.Tensor(1, 1, embed_dim))
+        else:
+            self.bias_k = self.bias_v = None
 
         assert (
             attention_window % 2 == 0
@@ -185,603 +193,423 @@ class MBartLongSelfAttention(nn.Module):
             attention_window > 0
         ), f"`attention_window` for layer {self.layer_id} has to be positive. Given {attention_window}"
 
-        self.one_sided_attn_window_size = attention_window // 2
+        self.one_sided_attention_window_size = attention_window // 2
+
+        self.reset_parameters()
+
+        self.onnx_trace = False
+        self.tpu = False
+
+    def reset_parameters(self):
+        if self.qkv_same_dim:
+            # Empirically observed the convergence to be much better with
+            # the scaled initialization
+            nn.init.xavier_uniform_(self.k_proj.weight, gain=1 / math.sqrt(2))
+            nn.init.xavier_uniform_(self.v_proj.weight, gain=1 / math.sqrt(2))
+            nn.init.xavier_uniform_(self.q_proj.weight, gain=1 / math.sqrt(2))
+
+            nn.init.xavier_uniform_(self.k_proj_global.weight, gain=1 / math.sqrt(2))
+            nn.init.xavier_uniform_(self.v_proj_global.weight, gain=1 / math.sqrt(2))
+            nn.init.xavier_uniform_(self.q_proj_global.weight, gain=1 / math.sqrt(2))
+
+        else:
+            nn.init.xavier_uniform_(self.k_proj.weight)
+            nn.init.xavier_uniform_(self.v_proj.weight)
+            nn.init.xavier_uniform_(self.q_proj.weight)
+
+            nn.init.xavier_uniform_(self.k_proj_global.weight)
+            nn.init.xavier_uniform_(self.v_proj_global.weight)
+            nn.init.xavier_uniform_(self.q_proj_global.weight)
+
+
+        nn.init.xavier_uniform_(self.out_proj.weight)
+
+        if self.out_proj.bias is not None:
+            nn.init.constant_(self.out_proj.bias, 0.)
+        if self.bias_k is not None:
+            nn.init.xavier_normal_(self.bias_k)
+        if self.bias_v is not None:
+            nn.init.xavier_normal_(self.bias_v)
 
     def forward(
         self,
-        hidden_states,
-        attention_mask=None,
-        layer_head_mask=None,
-        is_index_masked=None,
-        is_index_global_attn=None,
-        is_global_attn=None,
-        output_attentions=False,
-    ):
+        query,
+        key_padding_mask: Optional[Tensor] = None,
+        need_weights: bool = True,
+        static_kv: bool = False,
+        attn_mask: Optional[Tensor] = None,
+        before_softmax: bool = False,
+        need_head_weights: bool = False,
+    ) -> Tuple[Tensor, Optional[Tensor]]:
+        """Input shape: Time x Batch x Channel
+        Args:
+            key_padding_mask (ByteTensor, optional): mask to exclude
+                keys that are pads, of shape `(batch, src_len)`, where
+                padding elements are indicated by 1s.
+            need_weights (bool, optional): return the attention weights,
+                averaged over heads (default: False).
+            attn_mask (ByteTensor, optional): typically used to
+                implement causal attention, where the mask prevents the
+                attention from looking forward in time (default: None).
+            before_softmax (bool, optional): return the raw attention
+                weights and values before the attention softmax.
+            need_head_weights (bool, optional): return the attention
+                weights for each head. Implies *need_weights*. Default:
+                return the average attention weights over all heads.
         """
-        [`LongformerSelfAttention`] expects *len(hidden_states)* to be multiple of *attention_window*. Padding to
-        *attention_window* happens in [`LongformerModel.forward`] to avoid redoing the padding on each layer.
-        The *attention_mask* is changed in [`LongformerModel.forward`] from 0, 1, 2 to:
-            - -10000: no attention
-            - 0: local attention
-            - +10000: global attention
-        """
-        hidden_states = hidden_states.transpose(0, 1)
+        if need_head_weights:
+            need_weights = True
 
-        # project hidden states
-        query_vectors = self.query(hidden_states) * self.scaling
-        key_vectors = self.key(hidden_states)
-        value_vectors = self.value(hidden_states)
+        tgt_len, bsz, embed_dim = query.size()
+        assert embed_dim == self.embed_dim
+        assert list(query.size()) == [tgt_len, bsz, embed_dim]
+        assert not before_softmax 
+        assert not static_kv
 
-        seq_len, batch_size, embed_dim = hidden_states.size()
-        assert (
-            embed_dim == self.embed_dim
-        ), f"hidden_states should have embed_dim = {self.embed_dim}, but has {embed_dim}"
+        saved_state = None
 
-        # normalize query
-        query_vectors /= math.sqrt(self.head_dim)
+        if attn_mask is not None:
+            key_padding_mask = attn_mask < 0
+            extra_attention_mask = attn_mask > 0
+            remove_from_windowed_attention_mask = attn_mask != 0
 
-        query_vectors = query_vectors.view(seq_len, batch_size, self.num_heads, self.head_dim).transpose(0, 1)
-        key_vectors = key_vectors.view(seq_len, batch_size, self.num_heads, self.head_dim).transpose(0, 1)
+            num_extra_indices_per_batch = extra_attention_mask.long().sum(dim=1)
+            max_num_extra_indices_per_batch = num_extra_indices_per_batch.max()
+            if max_num_extra_indices_per_batch <= 0:
+                extra_attention_mask = None
+            else:
+                # To support the case of variable number of global attention in the rows of a batch,
+                # we use the following three selection masks to select global attention embeddings
+                # in a 3d tensor and pad it to `max_num_extra_indices_per_batch`
+                # 1) selecting embeddings that correspond to global attention
+                extra_attention_mask_nonzeros = extra_attention_mask.nonzero(as_tuple=True)
+                zero_to_max_range = torch.arange(
+                    0, max_num_extra_indices_per_batch, device=num_extra_indices_per_batch.device
+                )
+                # mask indicating which values are actually going to be padding
+                selection_padding_mask = zero_to_max_range < num_extra_indices_per_batch.unsqueeze(dim=-1)
+                # 2) location of the non-padding values in the selected global attention
+                selection_padding_mask_nonzeros = selection_padding_mask.nonzero(as_tuple=True)
+                # 3) location of the padding values in the selected global attention
+                selection_padding_mask_zeros = (selection_padding_mask == 0).nonzero(as_tuple=True)
+        else:
+            remove_from_windowed_attention_mask = None
+            extra_attention_mask = None
+            key_padding_mask = None
 
-        attn_scores = self._sliding_chunks_query_key_matmul(
-            query_vectors, key_vectors, self.one_sided_attn_window_size
-        )
 
-        # values to pad for attention probs
-        remove_from_windowed_attention_mask = (attention_mask != 0)[:, :, None, None]
+        q = self.q_proj(query)
+        k = self.k_proj(query)
+        v = self.v_proj(query)
 
-        # cast to fp32/fp16 then replace 1's with -inf
-        float_mask = remove_from_windowed_attention_mask.type_as(query_vectors).masked_fill(
-            remove_from_windowed_attention_mask, torch.finfo(query_vectors.dtype).min
-        )
-        # diagonal mask with zeros everywhere and -inf inplace of padding
-        diagonal_mask = self._sliding_chunks_query_key_matmul(
-            float_mask.new_ones(size=float_mask.size()), float_mask, self.one_sided_attn_window_size
-        )
+        q *= self.scaling
 
-        # pad local attention probs
-        attn_scores += diagonal_mask
-
-        assert list(attn_scores.size()) == [
-            batch_size,
-            seq_len,
+        q = q.view(tgt_len, bsz, self.num_heads, self.head_dim).transpose(0, 1)
+        k = k.view(tgt_len, bsz, self.num_heads, self.head_dim).transpose(0, 1)
+        # attn_weights = (batch_size, seqlen, num_heads, window*2+1)
+        attn_weights = self._sliding_chunks_matmul_qk(q, k, self.one_sided_attention_window_size)
+        if remove_from_windowed_attention_mask is not None:
+            # This implementation is fast and takes very little memory because num_heads x hidden_size = 1
+            # from (batch_size x seqlen) to (batch_size x seqlen x num_heads x hidden_size)
+            remove_from_windowed_attention_mask = remove_from_windowed_attention_mask.unsqueeze(dim=-1).unsqueeze(
+                dim=-1
+            )
+            # cast to fp32/fp16 then replace 1's with -inf
+            float_mask = remove_from_windowed_attention_mask.type_as(q).masked_fill(
+                remove_from_windowed_attention_mask, -10000.0
+            )
+            ones = float_mask.new_ones(size=float_mask.size())  # tensor of ones
+            # diagonal mask with zeros everywhere and -inf inplace of padding
+            d_mask = self._sliding_chunks_matmul_qk(ones, float_mask, self.one_sided_attention_window_size)
+            attn_weights += d_mask
+        assert list(attn_weights.size()) == [
+            bsz,
+            tgt_len,
             self.num_heads,
-            self.one_sided_attn_window_size * 2 + 1,
-        ], (
-            f"local_attn_probs should be of size ({batch_size}, {seq_len}, {self.num_heads},"
-            f" {self.one_sided_attn_window_size * 2 + 1}), but is of size {attn_scores.size()}"
-        )
-
-        # compute local attention probs from global attention keys and contact over window dim
-        if is_global_attn:
-            # compute global attn indices required through out forward fn
-            (
-                max_num_global_attn_indices,
-                is_index_global_attn_nonzero,
-                is_local_index_global_attn_nonzero,
-                is_local_index_no_global_attn_nonzero,
-            ) = self._get_global_attn_indices(is_index_global_attn)
-            # calculate global attn probs from global key
-
-            global_key_attn_scores = self._concat_with_global_key_attn_probs(
-                query_vectors=query_vectors,
-                key_vectors=key_vectors,
-                max_num_global_attn_indices=max_num_global_attn_indices,
-                is_index_global_attn_nonzero=is_index_global_attn_nonzero,
-                is_local_index_global_attn_nonzero=is_local_index_global_attn_nonzero,
-                is_local_index_no_global_attn_nonzero=is_local_index_no_global_attn_nonzero,
-            )
-            # concat to local_attn_probs
-            # (batch_size, seq_len, num_heads, extra attention count + 2*window+1)
-            attn_scores = torch.cat((global_key_attn_scores, attn_scores), dim=-1)
-
-            # free memory
-            del global_key_attn_scores
-
-        attn_probs = nn.functional.softmax(
-            attn_scores, dim=-1, dtype=torch.float32
-        )  # use fp32 for numerical stability
-
-        if layer_head_mask is not None:
-            assert layer_head_mask.size() == (
-                self.num_heads,
-            ), f"Head mask for a single layer should be of size {(self.num_heads,)}, but is {layer_head_mask.size()}"
-            attn_probs = layer_head_mask.view(1, 1, -1, 1) * attn_probs
-
-        # softmax sometimes inserts NaN if all positions are masked, replace them with 0
-        attn_probs = torch.masked_fill(attn_probs, is_index_masked[:, :, None, None], 0.0)
-        attn_probs = attn_probs.type_as(attn_scores)
-
-        # free memory
-        del attn_scores
-
-        # apply dropout
-        attn_probs = nn.functional.dropout(attn_probs, p=self.dropout, training=self.training)
-
-        value_vectors = value_vectors.view(seq_len, batch_size, self.num_heads, self.head_dim).transpose(0, 1)
-
-        # compute local attention output with global attention value and add
-        if is_global_attn:
-            # compute sum of global and local attn
-            attn_output = self._compute_attn_output_with_global_indices(
-                value_vectors=value_vectors,
-                attn_probs=attn_probs,
-                max_num_global_attn_indices=max_num_global_attn_indices,
-                is_index_global_attn_nonzero=is_index_global_attn_nonzero,
-                is_local_index_global_attn_nonzero=is_local_index_global_attn_nonzero,
-            )
-        else:
-            # compute local attn only
-            attn_output = self._sliding_chunks_matmul_attn_probs_value(
-                attn_probs, value_vectors, self.one_sided_attn_window_size
-            )
-
-        assert attn_output.size() == (batch_size, seq_len, self.num_heads, self.head_dim), "Unexpected size"
-        attn_output = attn_output.transpose(0, 1).reshape(seq_len, batch_size, embed_dim).contiguous()
-
-        # compute value for global attention and overwrite to attention output
-        # TODO: remove the redundant computation
-        if is_global_attn:
-            global_attn_output, global_attn_probs = self._compute_global_attn_output_from_hidden(
-                hidden_states=hidden_states,
-                max_num_global_attn_indices=max_num_global_attn_indices,
-                layer_head_mask=layer_head_mask,
-                is_local_index_global_attn_nonzero=is_local_index_global_attn_nonzero,
-                is_index_global_attn_nonzero=is_index_global_attn_nonzero,
-                is_local_index_no_global_attn_nonzero=is_local_index_no_global_attn_nonzero,
-                is_index_masked=is_index_masked,
-            )
-
-            # get only non zero global attn output
-            nonzero_global_attn_output = global_attn_output[
-                is_local_index_global_attn_nonzero[0], :, is_local_index_global_attn_nonzero[1]
-            ]
-
-            # overwrite values with global attention
-            attn_output[is_index_global_attn_nonzero[::-1]] = nonzero_global_attn_output.view(
-                len(is_local_index_global_attn_nonzero[0]), -1
-            )
-            # The attention weights for tokens with global attention are
-            # just filler values, they were never used to compute the output.
-            # Fill with 0 now, the correct values are in 'global_attn_probs'.
-            attn_probs[is_index_global_attn_nonzero] = 0
-
-        outputs = (attn_output.transpose(0, 1),)
-
-        if output_attentions:
-            outputs += (attn_probs,)
-
-        return outputs + (global_attn_probs,) if (is_global_attn and output_attentions) else outputs
-
-    @staticmethod
-    def _pad_and_transpose_last_two_dims(hidden_states_padded, padding):
-        """pads rows and then flips rows and columns"""
-        hidden_states_padded = nn.functional.pad(
-            hidden_states_padded, padding
-        )  # padding value is not important because it will be overwritten
-        hidden_states_padded = hidden_states_padded.view(
-            *hidden_states_padded.size()[:-2], hidden_states_padded.size(-1), hidden_states_padded.size(-2)
-        )
-        return hidden_states_padded
-
-    @staticmethod
-    def _pad_and_diagonalize(chunked_hidden_states):
-        """
-        shift every row 1 step right, converting columns into diagonals.
-        Example:
-        ```python
-        chunked_hidden_states: [
-            0.4983,
-            2.6918,
-            -0.0071,
-            1.0492,
-            -1.8348,
-            0.7672,
-            0.2986,
-            0.0285,
-            -0.7584,
-            0.4206,
-            -0.0405,
-            0.1599,
-            2.0514,
-            -1.1600,
-            0.5372,
-            0.2629,
+            self.one_sided_attention_window_size * 2 + 1,
         ]
-        window_overlap = num_rows = 4
-        ```
-                     (pad & diagonalize) => [ 0.4983, 2.6918, -0.0071, 1.0492, 0.0000, 0.0000, 0.0000
-                       0.0000, -1.8348, 0.7672, 0.2986, 0.0285, 0.0000, 0.0000 0.0000, 0.0000, -0.7584, 0.4206,
-                       -0.0405, 0.1599, 0.0000 0.0000, 0.0000, 0.0000, 2.0514, -1.1600, 0.5372, 0.2629 ]
-        """
-        total_num_heads, num_chunks, window_overlap, hidden_dim = chunked_hidden_states.size()
-        chunked_hidden_states = nn.functional.pad(
-            chunked_hidden_states, (0, window_overlap + 1)
-        )  # total_num_heads x num_chunks x window_overlap x (hidden_dim+window_overlap+1). Padding value is not important because it'll be overwritten
-        chunked_hidden_states = chunked_hidden_states.view(
-            total_num_heads, num_chunks, -1
-        )  # total_num_heads x num_chunks x window_overlap*window_overlap+window_overlap
-        chunked_hidden_states = chunked_hidden_states[
-            :, :, :-window_overlap
-        ]  # total_num_heads x num_chunks x window_overlap*window_overlap
-        chunked_hidden_states = chunked_hidden_states.view(
-            total_num_heads, num_chunks, window_overlap, window_overlap + hidden_dim
-        )
-        chunked_hidden_states = chunked_hidden_states[:, :, :, :-1]
-        return chunked_hidden_states
 
-    @staticmethod
-    def _chunk(hidden_states, window_overlap, onnx_export=False):
-        """convert into overlapping chunks. Chunk size = 2w, overlap size = w"""
-        if not onnx_export:
-            # non-overlapping chunks of size = 2w
-            hidden_states = hidden_states.view(
-                hidden_states.size(0),
-                torch.div(hidden_states.size(1), (window_overlap * 2), rounding_mode="trunc"),
-                window_overlap * 2,
-                hidden_states.size(2),
-            )
-            # use `as_strided` to make the chunks overlap with an overlap size = window_overlap
-            chunk_size = list(hidden_states.size())
-            chunk_size[1] = chunk_size[1] * 2 - 1
+        # the extra attention
+        if extra_attention_mask is not None:
+            selected_k = k.new_zeros(bsz, max_num_extra_indices_per_batch, self.num_heads, self.head_dim)
+            selected_k[selection_padding_mask_nonzeros] = k[extra_attention_mask_nonzeros]
+            # (batch_size, seqlen, num_heads, max_num_extra_indices_per_batch)
+            selected_attn_weights = torch.einsum("blhd,bshd->blhs", (q, selected_k))
+            selected_attn_weights[selection_padding_mask_zeros[0], :, :, selection_padding_mask_zeros[1]] = -10000.0
+            # concat to attn_weights
+            # (batch_size, seqlen, num_heads, extra attention count + 2*window+1)
+            attn_weights = torch.cat((selected_attn_weights, attn_weights), dim=-1)# the extra attention
 
-            chunk_stride = list(hidden_states.stride())
-            chunk_stride[1] = chunk_stride[1] // 2
-            return hidden_states.as_strided(size=chunk_size, stride=chunk_stride)
+        attn_weights_fp32 = F.softmax(attn_weights, dim=-1, dtype=torch.float32)  # use fp32 for numerical stability
+        attn_weights = attn_weights_fp32.type_as(attn_weights)
 
-        # When exporting to ONNX, use this separate logic
-        if hidden_states.size(1) == window_overlap * 2:
-            # simplest case
-            return hidden_states.unsqueeze(1)
+        src_len = tgt_len
+
+        # This is part of a workaround to get around fork/join parallelism
+        # not supporting Optional types.
+        if key_padding_mask is not None and key_padding_mask.dim() == 0:
+            key_padding_mask = None
+
+        if key_padding_mask is not None:
+            assert key_padding_mask.size(0) == bsz
+            assert key_padding_mask.size(1) == src_len
+
+
+        if key_padding_mask is not None:
+            # softmax sometimes inserts NaN if all positions are masked, replace them with 0
+            attn_weights = torch.masked_fill(attn_weights, key_padding_mask.unsqueeze(-1).unsqueeze(-1), 0.0)
+
+        attn_probs = F.dropout(attn_weights, p=self.dropout, training=self.training)
+        v = v.view(src_len, bsz, self.num_heads, self.head_dim).transpose(0, 1)
+
+        attn = None
+
+        if extra_attention_mask is not None:
+            selected_attn_probs = attn_probs.narrow(-1, 0, max_num_extra_indices_per_batch)
+            selected_v = v.new_zeros(bsz, max_num_extra_indices_per_batch, self.num_heads, self.head_dim)
+            selected_v[selection_padding_mask_nonzeros] = v[extra_attention_mask_nonzeros]
+            # use `matmul` because `einsum` crashes sometimes with fp16
+            # attn = torch.einsum('blhs,bshd->blhd', (selected_attn_probs, selected_v))
+            attn = torch.matmul(selected_attn_probs.transpose(1, 2), selected_v.transpose(1, 2)).transpose(1, 2)
+            attn_probs = attn_probs.narrow(
+                -1, max_num_extra_indices_per_batch, attn_probs.size(-1) - max_num_extra_indices_per_batch
+            ).contiguous()
+        if attn is None:
+            attn = self._sliding_chunks_matmul_pv(attn_probs, v, self.one_sided_attention_window_size)
         else:
-            # have to use slow implementation since as_strided, unfold and 2d-tensor indexing aren't supported (yet) in ONNX export
+            attn += self._sliding_chunks_matmul_pv(attn_probs, v, self.one_sided_attention_window_size)
 
-            # TODO replace this with
-            # > return hidden_states.unfold(dimension=1, size=window_overlap * 2, step=window_overlap).transpose(2, 3)
-            # once `unfold` is supported
+        assert attn.size() == (bsz, tgt_len, self.num_heads, self.head_dim), "Unexpected size"
+        attn = attn.transpose(0, 1).reshape(tgt_len, bsz, embed_dim).contiguous()
 
-            chunk_size = [
-                hidden_states.size(0),
-                hidden_states.size(1) // window_overlap - 1,
-                window_overlap * 2,
-                hidden_states.size(2),
+
+        # For this case, we'll just recompute the attention for these indices
+        # and overwrite the attn tensor.
+        # TODO: remove the redundant computation
+        if extra_attention_mask is not None:
+            selected_query = query.new_zeros(max_num_extra_indices_per_batch, bsz, embed_dim)
+            selected_query[selection_padding_mask_nonzeros[::-1]] = query[
+                extra_attention_mask_nonzeros[::-1]
             ]
 
-            overlapping_chunks = torch.empty(chunk_size)
-            for chunk in range(chunk_size[1]):
-                overlapping_chunks[:, chunk, :, :] = hidden_states[
-                    :, chunk * window_overlap : chunk * window_overlap + 2 * window_overlap, :
-                ]
-            return overlapping_chunks
+            q = self.q_proj_global(selected_query)
+            k = self.k_proj_global(query)
+            v = self.v_proj_global(query)
+            q *= self.scaling
+
+            q = (
+                q.contiguous()
+                .view(max_num_extra_indices_per_batch, bsz * self.num_heads, self.head_dim)
+                .transpose(0, 1)
+            )  # (batch_size * self.num_heads, max_num_extra_indices_per_batch, head_dim)
+            k = (
+                k.contiguous().view(-1, bsz * self.num_heads, self.head_dim).transpose(0, 1)
+            )  # batch_size * self.num_heads, seqlen, head_dim)
+            v = (
+                v.contiguous().view(-1, bsz * self.num_heads, self.head_dim).transpose(0, 1)
+            )  # batch_size * self.num_heads, seqlen, head_dim)
+            attn_weights = torch.bmm(q, k.transpose(1, 2))
+            assert list(attn_weights.size()) == [bsz * self.num_heads, max_num_extra_indices_per_batch, tgt_len]
+
+            attn_weights = attn_weights.view(bsz, self.num_heads, max_num_extra_indices_per_batch, tgt_len)
+            attn_weights[selection_padding_mask_zeros[0], :, selection_padding_mask_zeros[1], :] = -10000.0
+            if key_padding_mask is not None:
+                attn_weights = attn_weights.masked_fill(key_padding_mask.unsqueeze(1).unsqueeze(2), -10000.0,)
+            attn_weights = attn_weights.view(bsz * self.num_heads, max_num_extra_indices_per_batch, tgt_len)
+            attn_weights_float = F.softmax(
+                attn_weights, dim=-1, dtype=torch.float32
+            )  # use fp32 for numerical stability
+            attn_probs = F.dropout(attn_weights_float.type_as(attn_weights), p=self.dropout, training=self.training)
+            selected_attn = torch.bmm(attn_probs, v)
+            assert list(selected_attn.size()) == [
+                bsz * self.num_heads,
+                max_num_extra_indices_per_batch,
+                self.head_dim,
+            ]
+
+            selected_attn_4d = selected_attn.view(
+                bsz, self.num_heads, max_num_extra_indices_per_batch, self.head_dim
+            )
+            nonzero_selected_attn = selected_attn_4d[
+                selection_padding_mask_nonzeros[0], :, selection_padding_mask_nonzeros[1]
+            ]
+            attn[extra_attention_mask_nonzeros[::-1]] = nonzero_selected_attn.view(
+                len(selection_padding_mask_nonzeros[0]), -1
+            )
+
+        attn = self.out_proj(attn)
+        final_attn_weights: Optional[Tensor] = None
+        if need_weights:
+            if extra_attention_mask is not None:
+                final_attn_weights = attn_weights.view(bsz, self.num_heads, max_num_extra_indices_per_batch, tgt_len).transpose(0,1)
+              
+            else:
+                final_attn_weights = attn_weights.permute(0, 2, 1, 3).transpose(0,1)
+
+            if not need_head_weights:
+                # average attention weights over heads
+                final_attn_weights = final_attn_weights.mean(dim=0)
+
+
+        return attn, final_attn_weights, 0
+    
+    
+    @staticmethod
+    def _skew(x, direction):
+        """Convert diagonals into columns (or columns into diagonals depending on `direction`"""
+        x_padded = F.pad(x, direction)  # padding value is not important because it will be overwritten
+        x_padded = x_padded.view(*x_padded.size()[:-2], x_padded.size(-1), x_padded.size(-2))
+        return x_padded
 
     @staticmethod
-    def _mask_invalid_locations(input_tensor, affected_seq_len) -> torch.Tensor:
-        beginning_mask_2d = input_tensor.new_ones(affected_seq_len, affected_seq_len + 1).tril().flip(dims=[0])
+    def _skew2(x):
+        """shift every row 1 step to right converting columns into diagonals"""
+        # X = B x C x M x L
+        B, C, M, L = x.size()
+        x = F.pad(x, (0, M + 1))  # B x C x M x (L+M+1). Padding value is not important because it'll be overwritten
+        x = x.view(B, C, -1)  # B x C x ML+MM+M
+        x = x[:, :, :-M]  # B x C x ML+MM
+        x = x.view(B, C, M, M + L)  # B x C, M x L+M
+        x = x[:, :, :, :-1]
+        return x
+
+    @staticmethod
+    def _chunk(x, w):
+        """convert into overlapping chunkings. Chunk size = 2w, overlap size = w"""
+
+        # non-overlapping chunks of size = 2w
+        x = x.view(x.size(0), x.size(1) // (w * 2), w * 2, x.size(2))
+
+        # use `as_strided` to make the chunks overlap with an overlap size = w
+        chunk_size = list(x.size())
+        chunk_size[1] = chunk_size[1] * 2 - 1
+
+        chunk_stride = list(x.stride())
+        chunk_stride[1] = chunk_stride[1] // 2
+        return x.as_strided(size=chunk_size, stride=chunk_stride)
+    
+    def _mask_invalid_locations(self, input_tensor, w) -> torch.Tensor:
+        affected_seqlen = w
+        beginning_mask_2d = input_tensor.new_ones(w, w + 1).tril().flip(dims=[0])
         beginning_mask = beginning_mask_2d[None, :, None, :]
         ending_mask = beginning_mask.flip(dims=(1, 3))
-        beginning_input = input_tensor[:, :affected_seq_len, :, : affected_seq_len + 1]
+        beginning_input = input_tensor[:, :affected_seqlen, :, : w + 1]
         beginning_mask = beginning_mask.expand(beginning_input.size())
-        input_tensor[:, :affected_seq_len, :, : affected_seq_len + 1] = torch.full_like(
-            beginning_input, -float("inf")
-        ).where(beginning_mask.bool(), beginning_input)
-        ending_input = input_tensor[:, -affected_seq_len:, :, -(affected_seq_len + 1) :]
+        beginning_input.masked_fill_(beginning_mask == 1, -float("inf"))  # `== 1` converts to bool or uint8
+        ending_input = input_tensor[:, -affected_seqlen:, :, -(w + 1) :]
         ending_mask = ending_mask.expand(ending_input.size())
-        input_tensor[:, -affected_seq_len:, :, -(affected_seq_len + 1) :] = torch.full_like(
-            ending_input, -float("inf")
-        ).where(ending_mask.bool(), ending_input)
+        ending_input.masked_fill_(ending_mask == 1, -float("inf"))  # `== 1` converts to bool or uint8
 
-    def _sliding_chunks_query_key_matmul(self, query: torch.Tensor, key: torch.Tensor, window_overlap: int):
-        """
-        Matrix multiplication of query and key tensors using with a sliding window attention pattern. This
-        implementation splits the input into overlapping chunks of size 2w (e.g. 512 for pretrained Longformer) with an
-        overlap of size window_overlap
-        """
-        batch_size, seq_len, num_heads, head_dim = query.size()
-        assert (
-            seq_len % (window_overlap * 2) == 0
-        ), f"Sequence length should be multiple of {window_overlap * 2}. Given {seq_len}"
-        assert query.size() == key.size()
 
-        chunks_count = torch.div(seq_len, window_overlap, rounding_mode="trunc") - 1
+    def _sliding_chunks_matmul_qk(self, q: torch.Tensor, k: torch.Tensor, w: int):
+        """Matrix multiplicatio of query x key tensors using with a sliding window attention pattern.
+        This implementation splits the input into overlapping chunks of size 2w (e.g. 512 for pretrained Longformer)
+        with an overlap of size w"""
+        batch_size, seqlen, num_heads, head_dim = q.size()
+        assert seqlen % (w * 2) == 0, f"Sequence length should be multiple of {w * 2}. Given {seqlen}"
+        assert q.size() == k.size()
 
-        # group batch_size and num_heads dimensions into one, then chunk seq_len into chunks of size window_overlap * 2
-        query = query.transpose(1, 2).reshape(batch_size * num_heads, seq_len, head_dim)
-        key = key.transpose(1, 2).reshape(batch_size * num_heads, seq_len, head_dim)
+        chunks_count = seqlen // w - 1
 
-        query = self._chunk(query, window_overlap)
-        key = self._chunk(key, window_overlap)
+        # group batch_size and num_heads dimensions into one, then chunk seqlen into chunks of size w * 2
+        q = q.transpose(1, 2).reshape(batch_size * num_heads, seqlen, head_dim)
+        k = k.transpose(1, 2).reshape(batch_size * num_heads, seqlen, head_dim)
 
-        # matrix multiplication
-        # bcxd: batch_size * num_heads x chunks x 2window_overlap x head_dim
-        # bcyd: batch_size * num_heads x chunks x 2window_overlap x head_dim
-        # bcxy: batch_size * num_heads x chunks x 2window_overlap x 2window_overlap
-        diagonal_chunked_attention_scores = torch.einsum("bcxd,bcyd->bcxy", (query, key))  # multiply
+        chunk_q = self._chunk(q, w)
+        chunk_k = self._chunk(k, w)
+
+        # matrix multipication
+        # bcxd: batch_size * num_heads x chunks x 2w x head_dim
+        # bcyd: batch_size * num_heads x chunks x 2w x head_dim
+        # bcxy: batch_size * num_heads x chunks x 2w x 2w
+        chunk_attn = torch.einsum("bcxd,bcyd->bcxy", (chunk_q, chunk_k))  # multiply
 
         # convert diagonals into columns
-        diagonal_chunked_attention_scores = self._pad_and_transpose_last_two_dims(
-            diagonal_chunked_attention_scores, padding=(0, 0, 0, 1)
-        )
+        diagonal_chunk_attn = self._skew(chunk_attn, direction=(0, 0, 0, 1))
 
-        # allocate space for the overall attention matrix where the chunks are combined. The last dimension
-        # has (window_overlap * 2 + 1) columns. The first (window_overlap) columns are the window_overlap lower triangles (attention from a word to
-        # window_overlap previous words). The following column is attention score from each word to itself, then
-        # followed by window_overlap columns for the upper triangle.
+        # allocate space for the overall attention matrix where the chunks are compined. The last dimension
+        # has (w * 2 + 1) columns. The first (w) columns are the w lower triangles (attention from a word to
+        # w previous words). The following column is attention score from each word to itself, then
+        # followed by w columns for the upper triangle.
 
-        diagonal_attention_scores = diagonal_chunked_attention_scores.new_zeros(
-            (batch_size * num_heads, chunks_count + 1, window_overlap, window_overlap * 2 + 1)
-        )
+        diagonal_attn = diagonal_chunk_attn.new_empty((batch_size * num_heads, chunks_count + 1, w, w * 2 + 1))
 
-        # copy parts from diagonal_chunked_attention_scores into the combined matrix of attentions
+        # copy parts from diagonal_chunk_attn into the compined matrix of attentions
         # - copying the main diagonal and the upper triangle
-        diagonal_attention_scores[:, :-1, :, window_overlap:] = diagonal_chunked_attention_scores[
-            :, :, :window_overlap, : window_overlap + 1
-        ]
-        diagonal_attention_scores[:, -1, :, window_overlap:] = diagonal_chunked_attention_scores[
-            :, -1, window_overlap:, : window_overlap + 1
-        ]
+        diagonal_attn[:, :-1, :, w:] = diagonal_chunk_attn[:, :, :w, : w + 1]
+        diagonal_attn[:, -1, :, w:] = diagonal_chunk_attn[:, -1, w:, : w + 1]
         # - copying the lower triangle
-        diagonal_attention_scores[:, 1:, :, :window_overlap] = diagonal_chunked_attention_scores[
-            :, :, -(window_overlap + 1) : -1, window_overlap + 1 :
-        ]
-
-        diagonal_attention_scores[:, 0, 1:window_overlap, 1:window_overlap] = diagonal_chunked_attention_scores[
-            :, 0, : window_overlap - 1, 1 - window_overlap :
-        ]
+        diagonal_attn[:, 1:, :, :w] = diagonal_chunk_attn[:, :, -(w + 1) : -1, w + 1 :]
+        diagonal_attn[:, 0, 1:w, 1:w] = diagonal_chunk_attn[:, 0, : w - 1, 1 - w :]
 
         # separate batch_size and num_heads dimensions again
-        diagonal_attention_scores = diagonal_attention_scores.view(
-            batch_size, num_heads, seq_len, 2 * window_overlap + 1
-        ).transpose(2, 1)
+        diagonal_attn = diagonal_attn.view(batch_size, num_heads, seqlen, 2 * w + 1).transpose(2, 1)
 
-        self._mask_invalid_locations(diagonal_attention_scores, window_overlap)
-        return diagonal_attention_scores
+        self._mask_invalid_locations(diagonal_attn, w)
+        return diagonal_attn
 
-    def _sliding_chunks_matmul_attn_probs_value(
-        self, attn_probs: torch.Tensor, value: torch.Tensor, window_overlap: int
-    ):
-        """
-        Same as _sliding_chunks_query_key_matmul but for attn_probs and value tensors. Returned tensor will be of the
-        same shape as `attn_probs`
-        """
-        batch_size, seq_len, num_heads, head_dim = value.size()
 
-        assert seq_len % (window_overlap * 2) == 0
-        assert attn_probs.size()[:3] == value.size()[:3]
-        assert attn_probs.size(3) == 2 * window_overlap + 1
-        chunks_count = torch.div(seq_len, window_overlap, rounding_mode="trunc") - 1
-        # group batch_size and num_heads dimensions into one, then chunk seq_len into chunks of size 2 window overlap
-
-        chunked_attn_probs = attn_probs.transpose(1, 2).reshape(
-            batch_size * num_heads,
-            torch.div(seq_len, window_overlap, rounding_mode="trunc"),
-            window_overlap,
-            2 * window_overlap + 1,
-        )
+    def _sliding_chunks_matmul_pv(self, prob: torch.Tensor, v: torch.Tensor, w: int):
+        """Same as _sliding_chunks_matmul_qk but for prob and value tensors. It is expecting the same output
+        format from _sliding_chunks_matmul_qk"""
+        batch_size, seqlen, num_heads, head_dim = v.size()
+        assert seqlen % (w * 2) == 0
+        assert prob.size()[:3] == v.size()[:3]
+        assert prob.size(3) == 2 * w + 1
+        chunks_count = seqlen // w - 1
+        # group batch_size and num_heads dimensions into one, then chunk seqlen into chunks of size 2w
+        chunk_prob = prob.transpose(1, 2).reshape(batch_size * num_heads, seqlen // w, w, 2 * w + 1)
 
         # group batch_size and num_heads dimensions into one
-        value = value.transpose(1, 2).reshape(batch_size * num_heads, seq_len, head_dim)
+        v = v.transpose(1, 2).reshape(batch_size * num_heads, seqlen, head_dim)
 
-        # pad seq_len with w at the beginning of the sequence and another window overlap at the end
-        padded_value = nn.functional.pad(value, (0, 0, window_overlap, window_overlap), value=-1)
+        # pad seqlen with w at the beginning of the sequence and another w at the end
+        padded_v = F.pad(v, (0, 0, w, w), value=-1)
 
-        # chunk padded_value into chunks of size 3 window overlap and an overlap of size window overlap
-        chunked_value_size = (batch_size * num_heads, chunks_count + 1, 3 * window_overlap, head_dim)
-        chunked_value_stride = padded_value.stride()
-        chunked_value_stride = (
-            chunked_value_stride[0],
-            window_overlap * chunked_value_stride[1],
-            chunked_value_stride[1],
-            chunked_value_stride[2],
-        )
-        chunked_value = padded_value.as_strided(size=chunked_value_size, stride=chunked_value_stride)
+        # chunk padded_v into chunks of size 3w and an overlap of size w
+        chunk_v_size = (batch_size * num_heads, chunks_count + 1, 3 * w, head_dim)
+        chunk_v_stride = padded_v.stride()
+        chunk_v_stride = chunk_v_stride[0], w * chunk_v_stride[1], chunk_v_stride[1], chunk_v_stride[2]
+        chunk_v = padded_v.as_strided(size=chunk_v_size, stride=chunk_v_stride)
 
-        chunked_attn_probs = self._pad_and_diagonalize(chunked_attn_probs)
+        skewed_prob = self._skew2(chunk_prob)
 
-        context = torch.einsum("bcwd,bcdh->bcwh", (chunked_attn_probs, chunked_value))
-        return context.view(batch_size, num_heads, seq_len, head_dim).transpose(1, 2)
+        context = torch.einsum("bcwd,bcdh->bcwh", (skewed_prob, chunk_v))
+        return context.view(batch_size, num_heads, seqlen, head_dim).transpose(1, 2) 
+ 
+    
 
-    @staticmethod
-    def _get_global_attn_indices(is_index_global_attn):
-        """compute global attn indices required throughout forward pass"""
-        # helper variable
-        num_global_attn_indices = is_index_global_attn.long().sum(dim=1)
 
-        # max number of global attn indices in batch
-        max_num_global_attn_indices = num_global_attn_indices.max()
+    def upgrade_state_dict_named(self, state_dict, name):
+        prefix = name + "." if name != "" else ""
+        items_to_add = {}
+        keys_to_remove = []
+        for k in state_dict.keys():
+            if k.endswith(prefix + "in_proj_weight"):
+                # in_proj_weight used to be q + k + v with same dimensions
+                dim = int(state_dict[k].shape[0] / 3)
+                items_to_add[prefix + "q_proj.weight"] = state_dict[k][:dim]
+                items_to_add[prefix + "k_proj.weight"] = state_dict[k][dim : 2 * dim]
+                items_to_add[prefix + "v_proj.weight"] = state_dict[k][2 * dim :]
 
-        # indices of global attn
-        is_index_global_attn_nonzero = is_index_global_attn.nonzero(as_tuple=True)
+                keys_to_remove.append(k)
 
-        # helper variable
-        is_local_index_global_attn = torch.arange(
-            max_num_global_attn_indices, device=is_index_global_attn.device
-        ) < num_global_attn_indices.unsqueeze(dim=-1)
+                k_bias = prefix + "in_proj_bias"
+                if k_bias in state_dict.keys():
+                    dim = int(state_dict[k].shape[0] / 3)
+                    items_to_add[prefix + "q_proj.bias"] = state_dict[k_bias][:dim]
+                    items_to_add[prefix + "k_proj.bias"] = state_dict[k_bias][
+                        dim : 2 * dim
+                    ]
+                    items_to_add[prefix + "v_proj.bias"] = state_dict[k_bias][2 * dim :]
 
-        # location of the non-padding values within global attention indices
-        is_local_index_global_attn_nonzero = is_local_index_global_attn.nonzero(as_tuple=True)
+                    keys_to_remove.append(prefix + "in_proj_bias")
 
-        # location of the padding values within global attention indices
-        is_local_index_no_global_attn_nonzero = (is_local_index_global_attn == 0).nonzero(as_tuple=True)
-        return (
-            max_num_global_attn_indices,
-            is_index_global_attn_nonzero,
-            is_local_index_global_attn_nonzero,
-            is_local_index_no_global_attn_nonzero,
-        )
+        for k in keys_to_remove:
+            del state_dict[k]
 
-    def _concat_with_global_key_attn_probs(
-        self,
-        key_vectors,
-        query_vectors,
-        max_num_global_attn_indices,
-        is_index_global_attn_nonzero,
-        is_local_index_global_attn_nonzero,
-        is_local_index_no_global_attn_nonzero,
-    ):
-        batch_size = key_vectors.shape[0]
-
-        # create only global key vectors
-        key_vectors_only_global = key_vectors.new_zeros(
-            batch_size, max_num_global_attn_indices, self.num_heads, self.head_dim
-        )
-
-        key_vectors_only_global[is_local_index_global_attn_nonzero] = key_vectors[is_index_global_attn_nonzero]
-
-        # (batch_size, seq_len, num_heads, max_num_global_attn_indices)
-        attn_probs_from_global_key = torch.einsum("blhd,bshd->blhs", (query_vectors, key_vectors_only_global))
-
-        # need to transpose since ONNX export only supports consecutive indexing: https://pytorch.org/docs/stable/onnx.html#writes-sets
-        attn_probs_from_global_key = attn_probs_from_global_key.transpose(1, 3)
-        attn_probs_from_global_key[
-            is_local_index_no_global_attn_nonzero[0], is_local_index_no_global_attn_nonzero[1], :, :
-        ] = torch.finfo(attn_probs_from_global_key.dtype).min
-        attn_probs_from_global_key = attn_probs_from_global_key.transpose(1, 3)
-
-        return attn_probs_from_global_key
-
-    def _compute_attn_output_with_global_indices(
-        self,
-        value_vectors,
-        attn_probs,
-        max_num_global_attn_indices,
-        is_index_global_attn_nonzero,
-        is_local_index_global_attn_nonzero,
-    ):
-        batch_size = attn_probs.shape[0]
-
-        # cut local attn probs to global only
-        attn_probs_only_global = attn_probs.narrow(-1, 0, max_num_global_attn_indices)
-        # get value vectors for global only
-        value_vectors_only_global = value_vectors.new_zeros(
-            batch_size, max_num_global_attn_indices, self.num_heads, self.head_dim
-        )
-        value_vectors_only_global[is_local_index_global_attn_nonzero] = value_vectors[is_index_global_attn_nonzero]
-
-        # use `matmul` because `einsum` crashes sometimes with fp16
-        # attn = torch.einsum('blhs,bshd->blhd', (selected_attn_probs, selected_v))
-        # compute attn output only global
-        attn_output_only_global = torch.matmul(
-            attn_probs_only_global.transpose(1, 2).clone(), value_vectors_only_global.transpose(1, 2).clone()
-        ).transpose(1, 2)
-
-        # reshape attn probs
-        attn_probs_without_global = attn_probs.narrow(
-            -1, max_num_global_attn_indices, attn_probs.size(-1) - max_num_global_attn_indices
-        ).contiguous()
-
-        # compute attn output with global
-        attn_output_without_global = self._sliding_chunks_matmul_attn_probs_value(
-            attn_probs_without_global, value_vectors, self.one_sided_attn_window_size
-        )
-        return attn_output_only_global + attn_output_without_global
-
-    def _compute_global_attn_output_from_hidden(
-        self,
-        hidden_states,
-        max_num_global_attn_indices,
-        layer_head_mask,
-        is_local_index_global_attn_nonzero,
-        is_index_global_attn_nonzero,
-        is_local_index_no_global_attn_nonzero,
-        is_index_masked,
-    ):
-        seq_len, batch_size = hidden_states.shape[:2]
-
-        # prepare global hidden states
-        global_attn_hidden_states = hidden_states.new_zeros(max_num_global_attn_indices, batch_size, self.embed_dim)
-        global_attn_hidden_states[is_local_index_global_attn_nonzero[::-1]] = hidden_states[
-            is_index_global_attn_nonzero[::-1]
-        ]
-
-        # global key, query, value
-        global_query_vectors_only_global = self.query_global(global_attn_hidden_states)
-        global_key_vectors = self.key_global(hidden_states)
-        global_value_vectors = self.value_global(hidden_states)
-
-        # normalize
-        global_query_vectors_only_global /= math.sqrt(self.head_dim)
-
-        # reshape
-        global_query_vectors_only_global = (
-            global_query_vectors_only_global.contiguous()
-            .view(max_num_global_attn_indices, batch_size * self.num_heads, self.head_dim)
-            .transpose(0, 1)
-        )  # (batch_size * self.num_heads, max_num_global_attn_indices, head_dim)
-        global_key_vectors = (
-            global_key_vectors.contiguous().view(-1, batch_size * self.num_heads, self.head_dim).transpose(0, 1)
-        )  # batch_size * self.num_heads, seq_len, head_dim)
-        global_value_vectors = (
-            global_value_vectors.contiguous().view(-1, batch_size * self.num_heads, self.head_dim).transpose(0, 1)
-        )  # batch_size * self.num_heads, seq_len, head_dim)
-
-        # compute attn scores
-        global_attn_scores = torch.bmm(global_query_vectors_only_global, global_key_vectors.transpose(1, 2))
-
-        assert list(global_attn_scores.size()) == [
-            batch_size * self.num_heads,
-            max_num_global_attn_indices,
-            seq_len,
-        ], (
-            "global_attn_scores have the wrong size. Size should be"
-            f" {(batch_size * self.num_heads, max_num_global_attn_indices, seq_len)}, but is"
-            f" {global_attn_scores.size()}."
-        )
-
-        global_attn_scores = global_attn_scores.view(batch_size, self.num_heads, max_num_global_attn_indices, seq_len)
-
-        # need to transpose since ONNX export only supports consecutive indexing: https://pytorch.org/docs/stable/onnx.html#writes-sets
-        global_attn_scores = global_attn_scores.transpose(1, 2)
-        global_attn_scores[
-            is_local_index_no_global_attn_nonzero[0], is_local_index_no_global_attn_nonzero[1], :, :
-        ] = torch.finfo(global_attn_scores.dtype).min
-        global_attn_scores = global_attn_scores.transpose(1, 2)
-
-        global_attn_scores = global_attn_scores.masked_fill(
-            is_index_masked[:, None, None, :],
-            torch.finfo(global_attn_scores.dtype).min,
-        )
-
-        global_attn_scores = global_attn_scores.view(batch_size * self.num_heads, max_num_global_attn_indices, seq_len)
-
-        # compute global attn probs
-        global_attn_probs_float = nn.functional.softmax(
-            global_attn_scores, dim=-1, dtype=torch.float32
-        )  # use fp32 for numerical stability
-
-        # apply layer head masking
-        if layer_head_mask is not None:
-            assert layer_head_mask.size() == (
-                self.num_heads,
-            ), f"Head mask for a single layer should be of size {(self.num_heads,)}, but is {layer_head_mask.size()}"
-            global_attn_probs_float = layer_head_mask.view(1, -1, 1, 1) * global_attn_probs_float.view(
-                batch_size, self.num_heads, max_num_global_attn_indices, seq_len
-            )
-            global_attn_probs_float = global_attn_probs_float.view(
-                batch_size * self.num_heads, max_num_global_attn_indices, seq_len
-            )
-
-        global_attn_probs = nn.functional.dropout(
-            global_attn_probs_float.type_as(global_attn_scores), p=self.dropout, training=self.training
-        )
-
-        # global attn output
-        global_attn_output = torch.bmm(global_attn_probs, global_value_vectors)
-
-        assert list(global_attn_output.size()) == [
-            batch_size * self.num_heads,
-            max_num_global_attn_indices,
-            self.head_dim,
-        ], (
-            "global_attn_output tensor has the wrong size. Size should be"
-            f" {(batch_size * self.num_heads, max_num_global_attn_indices, self.head_dim)}, but is"
-            f" {global_attn_output.size()}."
-        )
-
-        global_attn_probs = global_attn_probs.view(batch_size, self.num_heads, max_num_global_attn_indices, seq_len)
-        global_attn_output = global_attn_output.view(
-            batch_size, self.num_heads, max_num_global_attn_indices, self.head_dim
-        )
-        return global_attn_output, global_attn_probs
+        for key, value in items_to_add.items():
+            state_dict[key] = value
 # Copied from transformers.models.bart.modeling_bart.BartAttention with Bart->MBart
 class MBartAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
