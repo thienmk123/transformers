@@ -233,7 +233,7 @@ class MBartLongSelfAttention(nn.Module):
 
     def forward(
         self,
-        hidden_state: Tensor,
+        hidden_states: Tensor,
         key_padding_mask: Optional[Tensor] = None,
         need_weights: bool = True,
         static_kv: bool = False,
