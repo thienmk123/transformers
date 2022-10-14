@@ -238,6 +238,7 @@ class MBartLongSelfAttention(nn.Module):
         need_weights: bool = True,
         static_kv: bool = False,
         attn_mask: Optional[Tensor] = None,
+        layer_head_mask: Optional[Tensor] = None,
         before_softmax: bool = False,
         need_head_weights: bool = False,
     ) -> Tuple[Tensor, Optional[Tensor]]:
@@ -419,6 +420,7 @@ class MBartLongSelfAttention(nn.Module):
             attn_weights_float = F.softmax(
                 attn_weights, dim=-1, dtype=torch.float32
             )  # use fp32 for numerical stability
+        
             attn_probs = F.dropout(attn_weights_float.type_as(attn_weights), p=self.dropout, training=self.training)
             selected_attn = torch.bmm(attn_probs, v)
             assert list(selected_attn.size()) == [
