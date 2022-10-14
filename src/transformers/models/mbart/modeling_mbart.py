@@ -158,7 +158,7 @@ class MBartLongSelfAttention(nn.Module):
     ):
         super().__init__()
         self.embed_dim = embed_dim
-        self.qkv_same_dim = self.kdim == embed_dim and self.vdim == embed_dim
+        self.qkv_same_dim = True
 
         self.num_heads = num_heads
         self.dropout = dropout
