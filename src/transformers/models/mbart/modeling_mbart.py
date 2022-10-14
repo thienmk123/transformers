@@ -235,9 +235,9 @@ class MBartLongSelfAttention(nn.Module):
         self,
         hidden_states: Tensor,
         key_padding_mask: Optional[Tensor] = None,
-        need_weights: bool = True,
+        output_attentions: bool = True,
         static_kv: bool = False,
-        attn_mask: Optional[Tensor] = None,
+        attention_mask: Optional[Tensor] = None,
         layer_head_mask: Optional[Tensor] = None,
         before_softmax: bool = False,
         need_head_weights: bool = False,
@@ -247,7 +247,7 @@ class MBartLongSelfAttention(nn.Module):
             key_padding_mask (ByteTensor, optional): mask to exclude
                 keys that are pads, of shape `(batch, src_len)`, where
                 padding elements are indicated by 1s.
-            need_weights (bool, optional): return the attention weights,
+            output_attentions (bool, optional): return the attention weights,
                 averaged over heads (default: False).
             attn_mask (ByteTensor, optional): typically used to
                 implement causal attention, where the mask prevents the
@@ -255,24 +255,24 @@ class MBartLongSelfAttention(nn.Module):
             before_softmax (bool, optional): return the raw attention
                 weights and values before the attention softmax.
             need_head_weights (bool, optional): return the attention
-                weights for each head. Implies *need_weights*. Default:
+                weights for each head. Implies *output_attentions*. Default:
                 return the average attention weights over all heads.
         """
         if need_head_weights:
-            need_weights = True
+            output_attentions = True
 
-        tgt_len, bsz, embed_dim = hidden_state.size()
+        tgt_len, bsz, embed_dim = hidden_states.size()
         assert embed_dim == self.embed_dim
-        assert list(hidden_state.size()) == [tgt_len, bsz, embed_dim]
+        assert list(hidden_states.size()) == [tgt_len, bsz, embed_dim]
         assert not before_softmax 
         assert not static_kv
 
         saved_state = None
 
-        if attn_mask is not None:
-            key_padding_mask = attn_mask < 0
-            extra_attention_mask = attn_mask > 0
-            remove_from_windowed_attention_mask = attn_mask != 0
+        if attention_mask is not None:
+            key_padding_mask = attention_mask < 0
+            extra_attention_mask = attention_mask > 0
+            remove_from_windowed_attention_mask = attention_mask != 0
 
             num_extra_indices_per_batch = extra_attention_mask.long().sum(dim=1)
             max_num_extra_indices_per_batch = num_extra_indices_per_batch.max()
@@ -299,9 +299,9 @@ class MBartLongSelfAttention(nn.Module):
             key_padding_mask = None
 
 
-        q = self.q_proj(hidden_state)
-        k = self.k_proj(hidden_state)
-        v = self.v_proj(hidden_state)
+        q = self.q_proj(hidden_states)
+        k = self.k_proj(hidden_states)
+        v = self.v_proj(hidden_states)
 
         q *= self.scaling
 
@@ -388,14 +388,14 @@ class MBartLongSelfAttention(nn.Module):
         # and overwrite the attn tensor.
         # TODO: remove the redundant computation
         if extra_attention_mask is not None:
-            selected_query = hidden_state.new_zeros(max_num_extra_indices_per_batch, bsz, embed_dim)
-            selected_query[selection_padding_mask_nonzeros[::-1]] = hidden_state[
+            selected_query = hidden_states.new_zeros(max_num_extra_indices_per_batch, bsz, embed_dim)
+            selected_query[selection_padding_mask_nonzeros[::-1]] = hidden_states[
                 extra_attention_mask_nonzeros[::-1]
             ]
 
             q = self.q_proj_global(selected_query)
-            k = self.k_proj_global(hidden_state)
-            v = self.v_proj_global(hidden_state)
+            k = self.k_proj_global(hidden_states)
+            v = self.v_proj_global(hidden_states)
             q *= self.scaling
 
             q = (
@@ -441,7 +441,7 @@ class MBartLongSelfAttention(nn.Module):
 
         attn = self.out_proj(attn)
         final_attn_weights: Optional[Tensor] = None
-        if need_weights:
+        if output_attentions:
             if extra_attention_mask is not None:
                 final_attn_weights = attn_weights.view(bsz, self.num_heads, max_num_extra_indices_per_batch, tgt_len).transpose(0,1)
               
