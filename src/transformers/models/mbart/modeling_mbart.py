@@ -233,7 +233,7 @@ class MBartLongSelfAttention(nn.Module):
 
     def forward(
         self,
-        query,
+        hidden_state: Tensor,
         key_padding_mask: Optional[Tensor] = None,
         need_weights: bool = True,
         static_kv: bool = False,
@@ -261,9 +261,9 @@ class MBartLongSelfAttention(nn.Module):
         if need_head_weights:
             need_weights = True
 
-        tgt_len, bsz, embed_dim = query.size()
+        tgt_len, bsz, embed_dim = hidden_state.size()
         assert embed_dim == self.embed_dim
-        assert list(query.size()) == [tgt_len, bsz, embed_dim]
+        assert list(hidden_state.size()) == [tgt_len, bsz, embed_dim]
         assert not before_softmax 
         assert not static_kv
 
@@ -299,9 +299,9 @@ class MBartLongSelfAttention(nn.Module):
             key_padding_mask = None
 
 
-        q = self.q_proj(query)
-        k = self.k_proj(query)
-        v = self.v_proj(query)
+        q = self.q_proj(hidden_state)
+        k = self.k_proj(hidden_state)
+        v = self.v_proj(hidden_state)
 
         q *= self.scaling
 
@@ -388,14 +388,14 @@ class MBartLongSelfAttention(nn.Module):
         # and overwrite the attn tensor.
         # TODO: remove the redundant computation
         if extra_attention_mask is not None:
-            selected_query = query.new_zeros(max_num_extra_indices_per_batch, bsz, embed_dim)
-            selected_query[selection_padding_mask_nonzeros[::-1]] = query[
+            selected_query = hidden_state.new_zeros(max_num_extra_indices_per_batch, bsz, embed_dim)
+            selected_query[selection_padding_mask_nonzeros[::-1]] = hidden_state[
                 extra_attention_mask_nonzeros[::-1]
             ]
 
             q = self.q_proj_global(selected_query)
-            k = self.k_proj_global(query)
-            v = self.v_proj_global(query)
+            k = self.k_proj_global(hidden_state)
+            v = self.v_proj_global(hidden_state)
             q *= self.scaling
 
             q = (
