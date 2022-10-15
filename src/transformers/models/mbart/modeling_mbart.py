@@ -269,6 +269,7 @@ class MBartLongSelfAttention(nn.Module):
         saved_state = None
 
         if attention_mask is not None:
+            attention_mask = attention_mask.squeeze(0).squeeze(0)
             key_padding_mask = attention_mask < 0
             extra_attention_mask = attention_mask > 0
             remove_from_windowed_attention_mask = attention_mask != 0
@@ -312,7 +313,7 @@ class MBartLongSelfAttention(nn.Module):
             # This implementation is fast and takes very little memory because num_heads x hidden_size = 1
             # from (batch_size x seqlen) to (batch_size x seqlen x num_heads x hidden_size)
             
-            remove_from_windowed_attention_mask = remove_from_windowed_attention_mask.squeeze(0).squeeze(0)[:, :, None, None]
+            remove_from_windowed_attention_mask = remove_from_windowed_attention_mask[:, :, None, None]
 
             # cast to fp32/fp16 then replace 1's with -inf
             float_mask = remove_from_windowed_attention_mask.type_as(q).masked_fill(
