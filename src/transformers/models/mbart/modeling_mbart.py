@@ -318,7 +318,7 @@ class MBartLongSelfAttention(nn.Module):
                 remove_from_windowed_attention_mask, -10000.0
             )
             ones = float_mask.new_ones(size=float_mask.size())  # tensor of ones
-            assert len(ones.size) == 4, "vẫn đéo phải 4 ư ?"
+            assert len(ones.size()) == 4, "vẫn đéo phải 4 ư ?"
             # diagonal mask with zeros everywhere and -inf inplace of padding
             d_mask = self._sliding_chunks_matmul_qk(ones, float_mask, self.one_sided_attention_window_size)
             attn_weights += d_mask
