@@ -269,7 +269,8 @@ class MBartLongSelfAttention(nn.Module):
         saved_state = None
 
         if attention_mask is not None:
-            attention_mask = attention_mask.squeeze(0).squeeze(0)
+
+            attention_mask = attention_mask.squeeze(1).squeeze(1)
             key_padding_mask = attention_mask < 0
             extra_attention_mask = attention_mask > 0
             remove_from_windowed_attention_mask = attention_mask != 0
