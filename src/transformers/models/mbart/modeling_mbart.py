@@ -318,6 +318,7 @@ class MBartLongSelfAttention(nn.Module):
                 remove_from_windowed_attention_mask, -10000.0
             )
             ones = float_mask.new_ones(size=float_mask.size())  # tensor of ones
+            assert len(ones.size) == 4, "vẫn đéo phải 4 ư ?"
             # diagonal mask with zeros everywhere and -inf inplace of padding
             d_mask = self._sliding_chunks_matmul_qk(ones, float_mask, self.one_sided_attention_window_size)
             attn_weights += d_mask
@@ -505,7 +506,7 @@ class MBartLongSelfAttention(nn.Module):
         """Matrix multiplicatio of query x key tensors using with a sliding window attention pattern.
         This implementation splits the input into overlapping chunks of size 2w (e.g. 512 for pretrained Longformer)
         with an overlap of size w"""
-        assert len(q.size()) == 4, "đéo phải bằng 4 rồi"
+
         batch_size, seqlen, num_heads, head_dim = q.size()
         assert seqlen % (w * 2) == 0, f"Sequence length should be multiple of {w * 2}. Given {seqlen}"
         assert q.size() == k.size()
