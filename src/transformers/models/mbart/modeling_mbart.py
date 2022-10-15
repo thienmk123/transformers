@@ -506,6 +506,7 @@ class MBartLongSelfAttention(nn.Module):
         """Matrix multiplicatio of query x key tensors using with a sliding window attention pattern.
         This implementation splits the input into overlapping chunks of size 2w (e.g. 512 for pretrained Longformer)
         with an overlap of size w"""
+        assert len(q.size()) == 4, "đéo phải bằng 4 rồi"
         batch_size, seqlen, num_heads, head_dim = q.size()
         assert seqlen % (w * 2) == 0, f"Sequence length should be multiple of {w * 2}. Given {seqlen}"
         assert q.size() == k.size()
