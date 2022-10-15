@@ -261,9 +261,8 @@ class MBartLongSelfAttention(nn.Module):
         if need_head_weights:
             output_attentions = True
 
-        tgt_len, bsz, embed_dim = hidden_states.size()
+        tgt_len, bsz, embed_dim = hidden_states.tranpose(0, 1).size()
         assert embed_dim == self.embed_dim
-        assert list(hidden_states.size()) == [tgt_len, bsz, embed_dim]
         assert not before_softmax 
         assert not static_kv
 
