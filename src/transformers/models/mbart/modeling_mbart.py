@@ -311,7 +311,7 @@ class MBartLongSelfAttention(nn.Module):
         if remove_from_windowed_attention_mask is not None:
             # This implementation is fast and takes very little memory because num_heads x hidden_size = 1
             # from (batch_size x seqlen) to (batch_size x seqlen x num_heads x hidden_size)
-            assert len(remove_from_windowed_attention_mask.size()) == 2, "Địt mẹ tại sao k phải 2 ?"
+            assert len(remove_from_windowed_attention_mask.size()) == 2, f"con cặc gì đây {remove_from_windowed_attention_mask.size()}"
             remove_from_windowed_attention_mask = remove_from_windowed_attention_mask[:, :, None, None]
 
             # cast to fp32/fp16 then replace 1's with -inf
