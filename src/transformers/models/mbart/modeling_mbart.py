@@ -1692,6 +1692,7 @@ class MBartModel(MBartPreTrainedModel):
             decoder_input_ids = shift_tokens_right(input_ids, self.config.pad_token_id)
 
         if encoder_outputs is None:
+            print(input_ids)
             encoder_outputs = self.encoder(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
