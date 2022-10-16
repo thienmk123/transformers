@@ -324,7 +324,7 @@ class MBartLongSelfAttention(nn.Module):
 
             # diagonal mask with zeros everywhere and -inf inplace of padding
             d_mask = self._sliding_chunks_matmul_qk(ones, float_mask, self.one_sided_attention_window_size)
-            assert 1 == 0, f"{attn_weights.shape}, {d_mask.shape}"
+            
             attn_weights += d_mask
         assert list(attn_weights.size()) == [
             bsz,
@@ -511,6 +511,7 @@ class MBartLongSelfAttention(nn.Module):
         This implementation splits the input into overlapping chunks of size 2w (e.g. 512 for pretrained Longformer)
         with an overlap of size w"""
 
+        assert 1 == 0, f"{q.shape}"
         batch_size, seqlen, num_heads, head_dim = q.size()
         assert seqlen % (w * 2) == 0, f"Sequence length should be multiple of {w * 2}. Given {seqlen}"
         assert q.size() == k.size()
