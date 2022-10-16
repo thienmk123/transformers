@@ -531,73 +531,50 @@ class TextDatasetForNextSentencePrediction(Dataset):
     def __getitem__(self, i):
         return self.examples[i]
 
-class Seq2SeqTextDataset(Dataset):
+
+class LongSeq2SeqDataset(Dataset):
     """
     This will be superseded by a framework-agnostic approach soon.
     """
 
-    def __init__(
-        self,
-        tokenizer: PreTrainedTokenizer,
-        source_file_path: str,
-        target_file_path: str,
-        block_size: int,
-        overwrite_cache=False,
-        cache_dir: Optional[str] = None,
-    ):
+    def __init__(self, tokenizer: PreTrainedTokenizer, file_path: str):
 
-        if os.path.isfile(source_file_path) is False:
-            raise ValueError(f"Input file path {source_file_path} not found")
+        if os.path.isfile(file_path) is False:
+            raise ValueError(f"Input file path {file_path} not found")
+        # Here, we do not cache the features, operating under the assumption
+        # that we will soon use fast multithreaded tokenizers from the
+        # `tokenizers` repo everywhere =)
+        logger.info(f"Creating features from dataset file at {file_path}")
 
-        block_size = block_size - tokenizer.num_special_tokens_to_add(pair=False)
+        # Get ref inf from file
+        with open(file_path, encoding="utf-8") as f:
+            raw_data = json.load(f)
 
-        directory, source_filename = os.path.split(source_file_path)
-        directory, target_filename = os.path.split(target_file_path)
+        self.examples = []
 
-        cached_features_file = os.path.join(
-            cache_dir if cache_dir is not None else directory,
-            f"cached_lm_{tokenizer.__class__.__name__}_{block_size}_{source_filename}",
-        )
+        block_sizes = [1024, 2048, 3072, 4096]
 
-        # Make sure only the first process in distributed training processes the dataset,
-        # and the others will use the cache.
-        lock_path = cached_features_file + ".lock"
-        with FileLock(lock_path):
+        for ex in raw_data:
+            model_inputs = tokenizer(ex['source'], add_special_tokens=True, max_length=4096)
+            tokenized_source_text = model_inputs["input_ids"]
+            len_source = len(tokenized_source_text)
+            block_size = 4096
 
-            if os.path.exists(cached_features_file) and not overwrite_cache:
-                start = time.time()
-                with open(cached_features_file, "rb") as handle:
-                    self.examples = pickle.load(handle)
-                logger.info(
-                    f"Loading features from cached file {cached_features_file} [took %.3f s]", time.time() - start
-                )
+            for i in block_sizes:
+                if len_source < i:
+                    block_size = i
+                    break
+            tokenized_source_text += [tokenizer.mask_token_id] * (block_size - len_source)
 
-            else:
-                logger.info(f"Creating features from dataset file at {directory}")
+            tokenized_target_text = tokenizer(ex['target'], add_special_tokens=True, max_length=1024)["input_ids"]
 
-                self.examples = []
-                with open(source_file_path, encoding="utf-8") as f:
-                    text = f.read()
-
-                source_tokenized_text = tokenizer.convert_tokens_to_ids(tokenizer.tokenize(text))
-
-                for i in range(0, len(source_tokenized_text) - block_size + 1, block_size):  # Truncate in block of block_size
-                    self.examples.append(
-                        tokenizer.build_inputs_with_special_tokens(source_tokenized_text[i : i + block_size])
-                    )
-                # Note that we are losing the last truncated example here for the sake of simplicity (no padding)
-                # If your dataset is small, first you should look for a bigger one :-) and second you
-                # can change this behavior by adding (model specific) padding.
-
-                start = time.time()
-                with open(cached_features_file, "wb") as handle:
-                    pickle.dump(self.examples, handle, protocol=pickle.HIGHEST_PROTOCOL)
-                logger.info(
-                    f"Saving features into cached file {cached_features_file} [took {time.time() - start:.3f} s]"
-                )
+            model_inputs["input_ids"] = torch.tensor(tokenized_source_text, dtype=torch.long)
+            model_inputs["labels"] = torch.tensor(tokenized_target_text, dtype=torch.long)
+            
+            self.examples.append(model_inputs)
 
     def __len__(self):
         return len(self.examples)
 
-    def __getitem__(self, i) -> torch.Tensor:
-        return torch.tensor(self.examples[i], dtype=torch.long)
+    def __getitem__(self, i) -> Dict[str, torch.tensor]:
+        return self.examples[i]
