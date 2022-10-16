@@ -113,6 +113,7 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] 
     """
     Expands attention_mask from `[bsz, seq_len]` to `[bsz, 1, tgt_seq_len, src_seq_len]`.
     """
+    assert len(mask.size()) == 2, f"{mask.size()}"
     bsz, src_len = mask.size()
     # tgt_len = tgt_len if tgt_len is not None else src_len
     if tgt_len != None:
