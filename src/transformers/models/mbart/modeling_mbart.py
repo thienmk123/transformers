@@ -114,13 +114,17 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] 
     Expands attention_mask from `[bsz, seq_len]` to `[bsz, 1, tgt_seq_len, src_seq_len]`.
     """
     bsz, src_len = mask.size()
-    tgt_len = tgt_len if tgt_len is not None else src_len
+    # tgt_len = tgt_len if tgt_len is not None else src_len
+    if tgt_len == None:
+        expanded_mask = mask[:, None, None, :].expand(bsz, 1, tgt_len, src_len).to(dtype)
 
-    expanded_mask = mask[:, None, None, :].expand(bsz, 1, tgt_len, src_len).to(dtype)
+        inverted_mask = 1.0 - expanded_mask
 
-    inverted_mask = 1.0 - expanded_mask
+        return inverted_mask.masked_fill(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
 
-    return inverted_mask.masked_fill(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
+    else: 
+        inverted_mask = 1.0 - mask
+        return inverted_mask.masked_fill(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
 
 
 # Copied from transformers.models.bart.modeling_bart.BartLearnedPositionalEmbedding with Bart->MBart
@@ -270,7 +274,6 @@ class MBartLongSelfAttention(nn.Module):
 
         if attention_mask is not None:
 
-            attention_mask = attention_mask.squeeze(1).squeeze(1)
             key_padding_mask = attention_mask < 0
             extra_attention_mask = attention_mask > 0
             remove_from_windowed_attention_mask = attention_mask != 0
@@ -323,7 +326,6 @@ class MBartLongSelfAttention(nn.Module):
             ones = float_mask.new_ones(size=float_mask.size())  # tensor of ones
 
             # diagonal mask with zeros everywhere and -inf inplace of padding
-            assert 1 == 0, f"{ones.shape}"
             d_mask = self._sliding_chunks_matmul_qk(ones, float_mask, self.one_sided_attention_window_size)
             
             attn_weights += d_mask
