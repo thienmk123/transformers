@@ -248,7 +248,7 @@ class MBartLongSelfAttention(nn.Module):
         need_head_weights: bool = False,
     ) -> Tuple[Tensor, Optional[Tensor]]:
 
-        assert 1 == 0, f"{hidden_states.size()}{attention_mask.size()}"
+
         """Input shape: Time x Batch x Channel
         Args:
             key_padding_mask (ByteTensor, optional): mask to exclude
