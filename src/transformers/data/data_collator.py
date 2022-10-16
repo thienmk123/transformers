@@ -583,7 +583,7 @@ class DataCollatorForSeq2Seq:
                 else:
                     feature["labels"] = np.concatenate([remainder, feature["labels"]]).astype(np.int64)
 
-        assert 1 == 0, f"{len(features[0]['inputs_ids'])}"
+        assert 1 == 0, f"{len(features[0]['input_ids'])}"
 
         features = self.tokenizer.pad(
             features,
