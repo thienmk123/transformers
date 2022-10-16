@@ -115,7 +115,7 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] 
     """
     bsz, src_len = mask.size()
     # tgt_len = tgt_len if tgt_len is not None else src_len
-    if tgt_len == None:
+    if tgt_len != None:
         expanded_mask = mask[:, None, None, :].expand(bsz, 1, tgt_len, src_len).to(dtype)
 
         inverted_mask = 1.0 - expanded_mask
