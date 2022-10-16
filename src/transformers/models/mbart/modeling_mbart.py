@@ -324,6 +324,7 @@ class MBartLongSelfAttention(nn.Module):
 
             # diagonal mask with zeros everywhere and -inf inplace of padding
             d_mask = self._sliding_chunks_matmul_qk(ones, float_mask, self.one_sided_attention_window_size)
+            assert 1 == 0, f"{attn_weights.shape}, {d_mask.shape}"
             attn_weights += d_mask
         assert list(attn_weights.size()) == [
             bsz,
