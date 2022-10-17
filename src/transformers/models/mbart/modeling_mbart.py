@@ -1389,6 +1389,7 @@ class MBartDecoder(MBartPreTrainedModel):
         # create causal mask
         # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
         combined_attention_mask = None
+        print(attention_mask.shape, input_shape, inputs_embeds.shape)
         if input_shape[-1] > 1:
             combined_attention_mask = _make_causal_mask(
                 input_shape, inputs_embeds.dtype, past_key_values_length=past_key_values_length
@@ -1399,6 +1400,8 @@ class MBartDecoder(MBartPreTrainedModel):
             expanded_attn_mask = _expand_mask(attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1]).to(
                 inputs_embeds.device
             )
+            print('-----')
+            print(attention_mask.shape, combined_attention_mask.shape)
             combined_attention_mask = (
                 expanded_attn_mask if combined_attention_mask is None else expanded_attn_mask + combined_attention_mask
             )
