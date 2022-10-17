@@ -449,6 +449,7 @@ class MBartLongSelfAttention(nn.Module):
             )
 
         attn = self.out_proj(attn)
+        
         final_attn_weights: Optional[Tensor] = None
         if output_attentions:
             if extra_attention_mask is not None:
@@ -461,7 +462,7 @@ class MBartLongSelfAttention(nn.Module):
                 # average attention weights over heads
                 final_attn_weights = final_attn_weights.mean(dim=0)
 
-
+        print(attn.shape, final_attn_weights.shape)
         return attn, final_attn_weights, 0
     
     
