@@ -268,15 +268,15 @@ class MBartLongSelfAttention(nn.Module):
         if need_head_weights:
             output_attentions = True
 
-        tgt_len, bsz, embed_dim = hidden_states.transpose(0, 1).size()
+        hidden_states = hidden_states.transpose(0, 1)
+        tgt_len, bsz, embed_dim = hidden_states.size()
+
         assert embed_dim == self.embed_dim
         assert not before_softmax 
         assert not static_kv
 
         saved_state = None
 
-        print(hidden_states.shape)
-        
         if attention_mask is not None:
 
             key_padding_mask = attention_mask < 0
