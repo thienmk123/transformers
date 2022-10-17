@@ -275,6 +275,8 @@ class MBartLongSelfAttention(nn.Module):
 
         saved_state = None
 
+        print(hidden_states.shape)
+        
         if attention_mask is not None:
 
             key_padding_mask = attention_mask < 0
@@ -462,8 +464,8 @@ class MBartLongSelfAttention(nn.Module):
                 # average attention weights over heads
                 final_attn_weights = final_attn_weights.mean(dim=0)
 
-        print(attn.shape)
-        return attn, final_attn_weights, 0
+
+        return attn.transpose(0, 1), final_attn_weights, 0
     
     
     @staticmethod
