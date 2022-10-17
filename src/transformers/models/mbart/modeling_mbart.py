@@ -240,7 +240,7 @@ class MBartLongSelfAttention(nn.Module):
         self,
         hidden_states: Tensor,
         key_padding_mask: Optional[Tensor] = None,
-        output_attentions: bool = True,
+        output_attentions: bool = False,
         static_kv: bool = False,
         attention_mask: Optional[Tensor] = None,
         layer_head_mask: Optional[Tensor] = None,
@@ -462,7 +462,7 @@ class MBartLongSelfAttention(nn.Module):
                 # average attention weights over heads
                 final_attn_weights = final_attn_weights.mean(dim=0)
 
-        print(attn.shape, final_attn_weights.shape)
+        print(attn.shape)
         return attn, final_attn_weights, 0
     
     
