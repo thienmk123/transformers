@@ -117,15 +117,14 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] 
     bsz, src_len = mask.size()
     # tgt_len = tgt_len if tgt_len is not None else src_len
     if tgt_len != None:
-        expanded_mask = mask[:, None, None, :].expand(bsz, 1, tgt_len, src_len).to(dtype)
+        expanded_mask = mask[:, None, None, :].expand(bsz, 1, tgt_len, src_len)
 
-        inverted_mask = 1 - (expanded_mask >= 0).to(torch.long) 
+        inverted_mask = 1 - (expanded_mask >= 0).to(dtype)
 
-        print(inverted_mask)
         return inverted_mask.masked_fill(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
 
     else:
-        return mask
+        return mask.to(dtype)
 
 
 # Copied from transformers.models.bart.modeling_bart.BartLearnedPositionalEmbedding with Bart->MBart
