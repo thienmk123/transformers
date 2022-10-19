@@ -118,8 +118,11 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] 
     # tgt_len = tgt_len if tgt_len is not None else src_len
     if tgt_len != None:
         expanded_mask = mask[:, None, None, :].expand(bsz, 1, tgt_len, src_len)
-
-        inverted_mask = 1 - (expanded_mask >= 0).to(dtype)
+        if tgt_len != src_len:
+            inverted_mask = 1 - (expanded_mask >= 0).to(dtype)
+            
+        else:
+            inverted_mask = 1 - expanded_mask.to(dtype)
 
         return inverted_mask.masked_fill(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
 
@@ -269,7 +272,7 @@ class MBartLongSelfAttention(nn.Module):
 
         hidden_states = hidden_states.transpose(0, 1)
         tgt_len, bsz, embed_dim = hidden_states.size()
-        
+
         assert embed_dim == self.embed_dim
         assert not before_softmax 
         assert not static_kv
