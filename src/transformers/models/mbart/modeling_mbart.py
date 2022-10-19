@@ -111,20 +111,20 @@ def _make_causal_mask(input_ids_shape: torch.Size, dtype: torch.dtype, past_key_
 # Copied from transformers.models.bart.modeling_bart._expand_mask
 def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
     """
-    Modified to accommodate LongSelfAttention.
+    Expands attention_mask from `[bsz, seq_len]` to `[bsz, 1, tgt_seq_len, src_seq_len]`.
     """
     
     bsz, src_len = mask.size()
     # tgt_len = tgt_len if tgt_len is not None else src_len
     if tgt_len != None:
-        expanded_mask = mask[:, None, None, :].expand(bsz, 1, tgt_len, src_len).to(dtype)
+        expanded_mask = mask[:, None, None, :].expand(bsz, 1, tgt_len, src_len)
 
-        inverted_mask = 1.0 - expanded_mask
+        inverted_mask = 1 - (expanded_mask >= 0).to(dtype)
 
         return inverted_mask.masked_fill(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
 
-    else: 
-        return mask
+    else:
+        return mask.to(dtype)
 
 
 # Copied from transformers.models.bart.modeling_bart.BartLearnedPositionalEmbedding with Bart->MBart
@@ -267,7 +267,9 @@ class MBartLongSelfAttention(nn.Module):
         if need_head_weights:
             output_attentions = True
 
-        tgt_len, bsz, embed_dim = hidden_states.transpose(0, 1).size()
+        hidden_states = hidden_states.transpose(0, 1)
+        tgt_len, bsz, embed_dim = hidden_states.size()
+        
         assert embed_dim == self.embed_dim
         assert not before_softmax 
         assert not static_kv
