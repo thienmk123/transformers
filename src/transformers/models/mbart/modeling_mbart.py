@@ -122,7 +122,7 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] 
         if tgt_len != src_len:
             inverted_mask = 1 - (expanded_mask >= 0).to(dtype)
         else:
-            invert_mask = 1 - expanded_mask.to(dtype)
+            inverted_mask = 1 - expanded_mask.to(dtype)
 
         return inverted_mask.masked_fill(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
 
