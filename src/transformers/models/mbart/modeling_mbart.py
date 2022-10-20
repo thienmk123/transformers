@@ -119,7 +119,7 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len=None):
     # tgt_len = tgt_len if tgt_len is not None else src_len
     if tgt_len != None:
         expanded_mask = mask[:, None, None, :].expand(bsz, 1, tgt_len, src_len)
-        if (mask == 10000).sum().item() != 0:
+        if ((mask == 10000).sum().item() != 0) or ((mask == -10000).sum().item() != 0) or ((mask == 0).sum().item() == bsz * src_len):
             inverted_mask = 1 - (expanded_mask >= 0).to(dtype)
         else:
             inverted_mask = 1 - expanded_mask.to(dtype)
