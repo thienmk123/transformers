@@ -110,7 +110,7 @@ def _make_causal_mask(input_ids_shape: torch.Size, dtype: torch.dtype, past_key_
 
 
 # Copied from transformers.models.bart.modeling_bart._expand_mask
-def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
+def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len=None):
     """
     Expands attention_mask from `[bsz, seq_len]` to `[bsz, 1, tgt_seq_len, src_seq_len]`.
     """
@@ -119,7 +119,7 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] 
     # tgt_len = tgt_len if tgt_len is not None else src_len
     if tgt_len != None:
         expanded_mask = mask[:, None, None, :].expand(bsz, 1, tgt_len, src_len)
-        if tgt_len != src_len:
+        if (mask == -1).sum().item() != 0:
             inverted_mask = 1 - (expanded_mask >= 0).to(dtype)
         else:
             inverted_mask = 1 - expanded_mask.to(dtype)
