@@ -349,7 +349,7 @@ class MBartLongSelfAttention(nn.Module):
             selected_k[selection_padding_mask_nonzeros] = k[extra_attention_mask_nonzeros]
             # (batch_size, seqlen, num_heads, max_num_extra_indices_per_batch)
             selected_attn_weights = torch.einsum("blhd,bshd->blhs", (q, selected_k))
-            selected_attn_weights[selection_padding_mask_zeros[0], :, :, selection_padding_mask_zeros[1]] = torch.finfo(q.dtype).min
+            selected_attn_weights[selection_padding_mask_zeros[0], :, :, selection_padding_mask_zeros[1]] = torch.finfo(selected_attn_weights.dtype).min
             # concat to attn_weights
             # (batch_size, seqlen, num_heads, extra attention count + 2*window+1)
             attn_weights = torch.cat((selected_attn_weights, attn_weights), dim=-1)# the extra attention
@@ -426,9 +426,9 @@ class MBartLongSelfAttention(nn.Module):
             assert list(attn_weights.size()) == [bsz * self.num_heads, max_num_extra_indices_per_batch, tgt_len]
 
             attn_weights = attn_weights.view(bsz, self.num_heads, max_num_extra_indices_per_batch, tgt_len)
-            attn_weights[selection_padding_mask_zeros[0], :, selection_padding_mask_zeros[1], :] = torch.finfo(q.dtype).min
+            attn_weights[selection_padding_mask_zeros[0], :, selection_padding_mask_zeros[1], :] =  torch.finfo(attn_weights.dtype).min
             if key_padding_mask is not None:
-                attn_weights = attn_weights.masked_fill(key_padding_mask.unsqueeze(1).unsqueeze(2), torch.finfo(q.dtype).min,)
+                attn_weights = attn_weights.masked_fill(key_padding_mask.unsqueeze(1).unsqueeze(2),  torch.finfo(attn_weights.dtype).min,)
             attn_weights = attn_weights.view(bsz * self.num_heads, max_num_extra_indices_per_batch, tgt_len)
             attn_weights_float = F.softmax(
                 attn_weights, dim=-1, dtype=torch.float32
