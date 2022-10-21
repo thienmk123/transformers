@@ -328,7 +328,7 @@ class MBartLongSelfAttention(nn.Module):
 
             # cast to fp32/fp16 then replace 1's with -inf
             float_mask = remove_from_windowed_attention_mask.type_as(q).masked_fill(
-                remove_from_windowed_attention_mask, -10000.0
+                remove_from_windowed_attention_mask, torch.finfo(q.dtype).min
             )
             ones = float_mask.new_ones(size=float_mask.size())  # tensor of ones
 
