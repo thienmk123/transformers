@@ -503,7 +503,7 @@ class QuestionAnsweringPipeline(ChunkPipeline):
     def postprocess(
         self,
         model_outputs,
-        top_k=1,
+        top_k=2,
         handle_impossible_answer=False,
         max_answer_len=15,
         align_to_words=True,
